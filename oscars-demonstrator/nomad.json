@@ -1,0 +1,9 @@
+{
+  "comment": "OSCARS XAS demonstrator upload. Discovers public X-ray absorption spectroscopy (XAS) data from two facilities through their own mechanisms - ESRF ID21 via the ICAT+ catalogue (anonymous, PaNET->ESRFET semantic mapping) and BESSY II via the NOMAD search API (by pynxtools NXxas definition) - converts the ESRF data to the NeXus NXxas application definition with pynxtools-xas, and runs the ewoks/est EXAFS workflow. ESRF data is served by the ESRF Data Portal under its data policy; please cite the individual dataset DOIs shown per entry. See https://oscars-project.eu/projects/findable-big-data-various-material-characterisation-techniques-0",
+  "references": [
+    "https://oscars-project.eu/projects/findable-big-data-various-material-characterisation-techniques-0",
+    "https://data.esrf.fr/",
+    "https://manual.nexusformat.org/classes/applications/NXxas.html",
+    "https://ewoksest.readthedocs.io/"
+  ]
+}

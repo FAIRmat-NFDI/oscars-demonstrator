@@ -1,0 +1,30 @@
+[project]
+name = "oscars-xas-demonstrator-env"
+version = "0.0.0"
+description = "Locked environment for running the OSCARS XAS demonstrator notebooks locally (nomad-semantic-web-service + pynxtools(-xas) + ewoks/est + jupyter)."
+requires-python = ">=3.12"
+dependencies = [
+    # ESRF catalogue search and download
+    "nomad-semantic-web-service catalogue==0.1.0",    
+    # NeXus / NXxas conversion
+    "pynxtools==0.15.2",
+    "pynxtools-xas==0.1.1",
+    # ewoks / est EXAFS workflow stack
+    "est",
+    "ewoks",
+    "ewoksorange",
+    "PyMca5",
+    "PyQt5",
+    "Orange3",
+
+    # Jupyter + inline NeXus viewer
+    "jupyterlab",
+    "jupyterlab-h5web",
+    "ipykernel",
+    "nbclient",
+    "h5py",
+]
+
+# This is only an environment lock, not a distributable package.
+[tool.uv]
+package = false
