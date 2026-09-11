@@ -5,7 +5,7 @@ description = "Locked environment for running the OSCARS XAS demonstrator notebo
 requires-python = ">=3.12"
 dependencies = [
     # ESRF catalogue search and download
-    "nomad-semantic-web-service catalogue==0.1.0",    
+    "nomad-semantic-web-service==0.1.0",    
     # NeXus / NXxas conversion
     "pynxtools==0.15.2",
     "pynxtools-xas==0.1.1",
