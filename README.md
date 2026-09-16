@@ -77,10 +77,9 @@ $ .venv/bin/python -m ipykernel install --user --name oscars-xas \
     --display-name "OSCARS XAS (est+pynxtools)"
 ```
 
-Configuration in the notebooks is environment-driven (all optional locally):
+Most configuration (BESSY endpoint, upload id, per-facility processing cap, ...)
+is plain constants near the top of each notebook — edit them inline rather than
+through the environment. The one real environment variable is:
 
-* `OSCARS_PYNX` — pynxtools-xas CLI (default `pynx`)
-* `NOMAD_BESSY_API` / `OSCARS_BESSY_UPLOAD` — BESSY deployment + upload id
-* `NOMAD_TOKEN` — bearer token for embargoed/private data
 * `NOMAD_SWS_SRC` — dev path to the `nomad-semantic-web-service` `src` (only if
   the package isn't installed)

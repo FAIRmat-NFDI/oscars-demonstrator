@@ -53,7 +53,7 @@ ewoks/est EXAFS workflow  ──▶  results  ──▶  NOMAD entry
 
 ### Common tail
 
-Both paths converge on a NXxas `.nxs` and run the **same** ewoks/est EXAFS graph (`example_pymca.ows`: Input → Normalization → EXAFS → k-weight → Fourier transform → Output), driven headlessly by `run_pymca_demo.py`. Base-NXxas files (BESSY foils and ESRF ID21 fluorescence alike) carry the signal at
+Both paths converge on a NXxas `.nxs` and run the **same** ewoks/est EXAFS graph (`example_pymca.ows`: Input → Normalization → EXAFS → k-weight → Fourier transform → Output), driven headlessly by `run_workflow.py`. Base-NXxas files (BESSY foils and ESRF ID21 fluorescence alike) carry the signal at
 `entry/intensity`, so the workflow is run with `signal="intensity"`. Each result is written back as a NOMAD `.archive.yaml` entry plus a result `.h5`.
 
 ---
@@ -83,5 +83,5 @@ carry it (`QT_QPA_PLATFORM=offscreen` is set for the headless Orange import).
 | `1_full_pipeline.ipynb` | notebook 1 — pull everything from the notebook |
 | `2_eln_esrf_plus_bessy.ipynb` | notebook 2 — ESRF via the ELN + BESSY |
 | `oscars_demo.py` | orchestration helpers (map/search/download/convert/ewoks/result) |
-| `run_pymca_demo.py` | headless ewoks/est EXAFS runner (NXxas-aware) |
+| `run_workflow.py` | headless ewoks/est EXAFS runner (NXxas-aware) |
 | `nomad.json` | upload metadata (comment + references) |

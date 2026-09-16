@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 from pathlib import Path
@@ -26,6 +27,7 @@ from ewoks import convert_graph, execute_graph  # noqa: E402
 from ewoksorange.gui.workflows.owscheme import ows_to_ewoks  # noqa: E402
 from est import resources  # noqa: E402
 import h5py  # noqa: E402
+import numpy  # noqa: E402
 
 
 WORKFLOW_STEPS = [
@@ -228,6 +230,77 @@ def resolve_signal_path(h5: h5py.File, scan: str, signal: str) -> str:
     return dataset_path(scan, signal, SIGNAL_PRESETS)
 
 
+# Maps a NeXus energy dataset's "units" attribute to the pint unit name est/
+# PyMca expects. Anything else is passed through as-is and left to pint, which
+# raises a clear error if it can't parse it.
+_ENERGY_UNIT_TO_PINT = {
+    "ev": "electron_volt",
+    "kev": "kiloelectron_volt",
+    "electron_volt": "electron_volt",
+    "kiloelectron_volt": "kiloelectron_volt",
+}
+
+# eV per unit, for the plausibility check in resolve_energy_unit.
+_ENERGY_UNIT_TO_EV = {"electron_volt": 1.0, "kiloelectron_volt": 1000.0}
+
+
+def read_element_edge(h5: h5py.File, scan: str) -> tuple[str | None, str | None]:
+    """Element/edge names from "{scan}/element/name" / "{scan}/edge/name", if
+    present (the NXxas convention used by both ESRF and BESSY conversions)."""
+
+    def _text(path: str) -> str | None:
+        node = h5.get(path)
+        if node is None:
+            return None
+        value = node[()]
+        return value.decode() if isinstance(value, bytes) else str(value)
+
+    return _text(f"{scan}/element/name"), _text(f"{scan}/edge/name")
+
+
+def resolve_energy_unit(h5: h5py.File, scan: str, energy_path: str) -> str:
+    """Pint unit name for the dataset at *energy_path*, from its own "units"
+    attribute.
+
+    NXxas files self-describe this, and it genuinely varies: ESRF ID21 stores
+    eV, BESSY typically keV -- hardcoding one unit for every file/facility
+    silently feeds est/PyMca a wrong absolute energy scale for whichever one it
+    doesn't match (edge-finding then operates on a physically nonsensical
+    range, e.g. 20 eV instead of 20 keV, and normalization "succeeds" anyway
+    with degenerate results -- it does not raise).
+
+    If ``xraydb`` and the entry's element/edge are both available, this also
+    sanity-checks the resolved unit against the tabulated edge energy and
+    *warns* (does not override) when the file's stated unit looks physically
+    implausible -- this is a real, observed case: a BESSY myspot NXxas file
+    whose energy is actually in keV but tagged "eV".
+    """
+    raw_unit = h5[energy_path].attrs.get("units", "")
+    raw_unit = raw_unit.decode() if isinstance(raw_unit, bytes) else str(raw_unit)
+    unit = _ENERGY_UNIT_TO_PINT.get(raw_unit.strip().lower(), raw_unit or "electron_volt")
+
+    element, edge = read_element_edge(h5, scan)
+    scale_to_ev = _ENERGY_UNIT_TO_EV.get(unit)
+    if element and edge and scale_to_ev:
+        try:
+            import xraydb
+
+            tabulated_ev = xraydb.xray_edge(element, edge).energy
+            values = h5[energy_path][:]
+            observed_ev = float(numpy.median(values)) * scale_to_ev
+            if tabulated_ev and not (0.1 < observed_ev / tabulated_ev < 10):
+                print(
+                    f"Warning: {scan!r} energy (units={raw_unit!r} -> {unit!r}) "
+                    f"has median {observed_ev:.1f} eV, far from the tabulated "
+                    f"{element} {edge} edge ({tabulated_ev:.1f} eV) -- the "
+                    "file's 'units' attribute may be wrong; using it as stated.",
+                    file=sys.stderr,
+                )
+        except Exception:
+            pass  # best-effort sanity check only; never block on it
+    return unit
+
+
 def _scan_sort_key(scan: str) -> tuple[int, float | str]:
     """Sort BLISS-style numeric scan names ("10.1") numerically; anything
     else (e.g. converted NXxas entry names) falls back to name order."""
@@ -300,8 +373,15 @@ def hdf5_input_information(
     scan: str,
     energy: str,
     signal: str,
-    energy_unit: str,
+    energy_unit: str | None = None,
 ) -> dict[str, str]:
+    """Build est's ``input_information`` dict for *scan* in *input_file*.
+
+    *energy_unit* is optional: when omitted (the default), it is auto-detected
+    from the resolved energy dataset's own "units" attribute via
+    ``resolve_energy_unit`` -- see that function for why a single hardcoded
+    unit is wrong across facilities/files. Pass an explicit unit to override.
+    """
     input_file = input_file.resolve()
 
     with h5py.File(input_file, "r") as h5:
@@ -316,6 +396,8 @@ def hdf5_input_information(
                 f"{energy_path}={h5[energy_path].shape}, "
                 f"{signal_path}={h5[signal_path].shape}"
             )
+        if energy_unit is None:
+            energy_unit = resolve_energy_unit(h5, scan, energy_path)
 
     return {
         "channel_url": f"silx://{input_file}?{energy_path}",
@@ -341,17 +423,202 @@ def default_output_file(input_file: Path, scan: str | None) -> Path:
     return ROOT / "outputs" / "pymca_exafs_result.h5"
 
 
-def execute_pymca_workflow(
+def _scale_energy_to_e0(energy: numpy.ndarray, e0: float | None) -> numpy.ndarray:
+    """Rescale *energy* so its magnitude matches *e0*.
+
+    This corrects a genuine est/PyMca inconsistency, not a units bug of ours:
+    ``e0`` is found via an internal magnitude heuristic ("these values look
+    like keV, not eV" auto-correction) that is *not* reflected back into the
+    ``Spectrum.energy`` array est returns -- e.g. for a scan nominally
+    spanning ~20 ("electron_volt"), ``e0`` can come back as ~20000 while
+    ``energy`` itself stays at ~20 (observed on the BESSY myspot file, with
+    the same ``e0`` regardless of which energy_unit was declared at read
+    time). Left alone, comparing ``energy`` to ``e0`` (e.g. for the pre/post-
+    edge split below) is comparing two different scales.
+
+    Detects the implied power-of-10 correction from the ratio of ``e0`` to
+    the array's median and applies it; leaves *energy* untouched when the two
+    are already consistent (e.g. every file where est's own energy_unit
+    handling isn't tripped by this quirk).
+    """
+    if e0 is None or energy.size == 0:
+        return energy
+    median = float(numpy.median(numpy.abs(energy)))
+    if median <= 0:
+        return energy
+    ratio = e0 / median
+    if ratio <= 0:
+        return energy
+    power = round(math.log10(ratio))
+    if power == 0:
+        return energy
+    scale = 10.0**power
+    if not (0.5 < ratio / scale < 2.0):
+        return energy  # not a clean power-of-10 mismatch; leave as-is
+    print(
+        f"Note: energy (median {median:.3g}) vs e0 ({e0:.3g}) implies a "
+        f"x{scale:g} scale correction (a known est/PyMca quirk: e0 is found "
+        "via an internal magnitude heuristic not reflected in the returned "
+        "energy array) -- applying it for self-consistency.",
+        file=sys.stderr,
+    )
+    return energy * scale
+
+
+def write_processed_spectrum(xas_obj, output_file: Path, entry: str) -> bool:
+    """Persist the derived EXAFS quantities into *output_file*, as proper
+    ``NXdata`` groups under ``"{entry}/process"`` (an ``NXprocess``), with a
+    NeXus default-plot chain ending at the Fourier transform.
+
+    est's own ``XASObject.to_file()`` -- what the ``.ows`` graph's final
+    "output" node calls -- only ever writes the raw energy/absorbed_beam it
+    read in (see ``est/core/io/write_xas.py``); the derived, actually-
+    interesting quantities are never serialized by that path. Without this,
+    every result file from this pipeline is scientifically empty regardless
+    of input file or facility, even though the computation itself is correct.
+
+    Layout::
+
+        {entry}/process/                   NXprocess, @default="fourier_transform"
+          energy, k, e0, edge_step           shared axes / scalars
+          normalized_mu/                     NXdata vs "energy" (full range)
+          pre_edge/                          NXdata vs "energy", sliced to energy <= e0
+          post_edge/                         NXdata vs "energy", sliced to energy >= e0
+          chi/                               NXdata vs "k"
+          fourier_transform/                 NXdata vs "radius" (real/imaginary too)
+
+    est doesn't expose the pre/post-edge fit's own energy windows as metadata
+    (checked ``spectrum.pymca_dict``/``xas_obj.configuration``: not present),
+    so pre_edge/post_edge are sliced at the one reliably-available boundary,
+    ``e0`` -- each curve shown only on its physically meaningful side of the
+    edge, rather than PyMca's raw full-range extrapolation.
+
+    Only handles the single-spectrum case (``n_spectrum == 1``), matching this
+    demo's scope (every file exercised so far is a single 1D scan); a real
+    multi-spectrum map warrants its own N-dimensional NXdata design (est's own
+    raw-echo writer keeps a whole map under one NXentry, not one per pixel),
+    so it's skipped with a warning rather than guessed at here.
+    """
+    if xas_obj.n_spectrum != 1:
+        print(
+            f"Warning: XASObject has {xas_obj.n_spectrum} spectra; "
+            "write_processed_spectrum only handles a single spectrum, skipping.",
+            file=sys.stderr,
+        )
+        return False
+
+    spectrum = xas_obj.get_spectrum(0, 0)
+    if spectrum.energy is None or spectrum.normalized_mu is None:
+        return False
+
+    energy = numpy.asarray(spectrum.energy)
+    e0 = float(spectrum.e0) if spectrum.e0 is not None else None
+    energy = _scale_energy_to_e0(energy, e0)
+    wrote_any = False
+
+    with h5py.File(output_file, "a") as h5:
+        process = h5.require_group(f"{entry}/process")
+        for name in list(process.keys()):
+            del process[name]
+        process.attrs["NX_class"] = "NXprocess"
+        process.attrs["program"] = "est.core.process.pymca"
+        process["energy"] = energy
+        if e0 is not None:
+            process["e0"] = e0
+        if spectrum.edge_step is not None:
+            process["edge_step"] = float(spectrum.edge_step)
+
+        def add_nxdata(name: str, signal_name: str, signal, axis_name: str, axis) -> None:
+            nonlocal wrote_any
+            group = process.require_group(name)
+            group.attrs["NX_class"] = "NXdata"
+            group.attrs["signal"] = signal_name
+            group.attrs["axes"] = axis_name
+            group[signal_name] = numpy.asarray(signal)
+            if isinstance(axis, h5py.SoftLink):
+                group[axis_name] = axis
+            else:
+                group[axis_name] = numpy.asarray(axis)
+            wrote_any = True
+
+        energy_link = h5py.SoftLink(process["energy"].name)
+        add_nxdata("normalized_mu", "normalized_mu", spectrum.normalized_mu, "energy", energy_link)
+
+        if spectrum.pre_edge is not None:
+            mask = energy <= e0 if e0 is not None else slice(None)
+            add_nxdata(
+                "pre_edge", "pre_edge", numpy.asarray(spectrum.pre_edge)[mask],
+                "energy", energy[mask] if e0 is not None else energy_link,
+            )
+
+        if spectrum.post_edge is not None:
+            mask = energy >= e0 if e0 is not None else slice(None)
+            add_nxdata(
+                "post_edge", "post_edge", numpy.asarray(spectrum.post_edge)[mask],
+                "energy", energy[mask] if e0 is not None else energy_link,
+            )
+
+        if spectrum.chi is not None and spectrum.k is not None:
+            process["k"] = numpy.asarray(spectrum.k)
+            add_nxdata("chi", "chi", spectrum.chi, "k", h5py.SoftLink(process["k"].name))
+
+        ft = spectrum.ft
+        if ft is not None and ft.radius is not None and ft.intensity is not None:
+            ft_group = process.require_group("fourier_transform")
+            ft_group.attrs["NX_class"] = "NXdata"
+            ft_group.attrs["signal"] = "intensity"
+            ft_group.attrs["axes"] = "radius"
+            ft_group["radius"] = numpy.asarray(ft.radius)
+            ft_group["intensity"] = numpy.asarray(ft.intensity)
+            if ft.real is not None:
+                ft_group["real"] = numpy.asarray(ft.real)
+            if ft.imaginary is not None:
+                ft_group["imaginary"] = numpy.asarray(ft.imaginary)
+            process.attrs["default"] = "fourier_transform"
+            h5[entry].attrs["default"] = "process"
+            h5.attrs.setdefault("NX_class", "NXroot")
+            h5.attrs["default"] = entry  # completes the chain from the file root
+            wrote_any = True
+
+    return wrote_any
+
+
+def execute_est_workflow(
     input_information: dict[str, str],
     input_file: Path,
     output_file: Path,
     scan: str | None = None,
+    workflow_name: str = "example_pymca",
 ) -> dict[str, object]:
+    """Run one of est's tutorial ``.ows`` graphs (an Input -> ... -> Output
+    ewoks pipeline) on *input_information*.
+
+    *workflow_name* is an est tutorial workflow name, without ``.ows`` (see
+    ``est/resources/tutorials``) -- e.g.:
+
+    * ``"example_pymca"`` (default) -- PyMca-based normalization/EXAFS/
+      k-weight/FT. Proven against every file this demo has been tested with.
+    * ``"example_larch"`` -- xraylarch-based pre_edge/autobk/xftf. **Currently
+      fails** on at least the BESSY myspot file (its "autobk" step raises
+      "zero-size array to reduction operation minimum" -- an est/larch-side
+      issue, not specific to this demo's code). Wired in as an option, but
+      treat it as experimental rather than a proven drop-in alternative.
+
+    Either way, the derived spectrum (normalized_mu/pre_edge/post_edge/chi/k/
+    fourier_transform) is read off the resulting ``Spectrum`` via
+    ``write_processed_spectrum`` -- those field names are backend-agnostic in
+    est's model, so no workflow-specific handling is needed there.
+    """
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
-    print_workflow_steps()
+    is_pymca = workflow_name == "example_pymca"
+    if is_pymca:
+        print_workflow_steps()
+    else:
+        print_banner("EWOKSEST XAS WORKFLOW DEMO")
+        print(f"Workflow: {workflow_name}", flush=True)
 
-    with resources.tutorial_workflow("example_pymca.ows") as workflow:
+    with resources.tutorial_workflow(f"{workflow_name}.ows") as workflow:
         print(f"Workflow file : {workflow}")
         print(f"Input data    : {input_file}")
         if scan:
@@ -386,13 +653,25 @@ def execute_pymca_workflow(
         )
         elapsed = perf_counter() - started_at
 
+    xas_obj = result.get("xas_obj")
+    wrote_processed = (
+        write_processed_spectrum(xas_obj, output_file, xas_obj.entry)
+        if xas_obj is not None
+        else False
+    )
+
     print_banner("EXECUTION COMPLETE")
-    for index, (name, _) in enumerate(WORKFLOW_STEPS, start=1):
-        print(f"  [OK] Step {index:02d}: {name}")
-    print()
+    if is_pymca:
+        for index, (name, _) in enumerate(WORKFLOW_STEPS, start=1):
+            print(f"  [OK] Step {index:02d}: {name}")
+        print()
     print(f"Elapsed time : {elapsed:.2f} seconds")
     print(f"Result file  : {result['result']}")
     print(f"File exists  : {'yes' if output_file.exists() else 'no'}")
+    if wrote_processed:
+        print(f"Processed data (normalized_mu, chi, k, FT): written to {xas_obj.entry}/process")
+    else:
+        print("Processed data (normalized_mu, chi, k, FT): NOT written (see warnings above)")
     print("=" * 78, flush=True)
     return result
 
@@ -400,8 +679,9 @@ def execute_pymca_workflow(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run the ewoksest PyMca tutorial workflow on the packaged sample "
-            "or on ESRF BLISS/NeXus HDF5 scans."
+            "Run an ewoksest tutorial workflow (--workflow, default "
+            "example_pymca) on the packaged sample or on ESRF BLISS/NeXus "
+            "HDF5 scans."
         )
     )
     parser.add_argument(
@@ -431,8 +711,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--energy-unit",
-        default="kiloelectron_volt",
-        help="Energy unit for HDF5 inputs. Default: kiloelectron_volt.",
+        default=None,
+        help=(
+            "Energy unit for HDF5 inputs. Default: auto-detected from the "
+            "energy dataset's own 'units' attribute (see resolve_energy_unit)."
+        ),
+    )
+    parser.add_argument(
+        "--workflow",
+        default="example_pymca",
+        help=(
+            "est tutorial .ows workflow to run, without the extension. "
+            "Default: example_pymca (proven). example_larch is wired in but "
+            "currently fails on at least the BESSY myspot file -- see "
+            "execute_est_workflow's docstring."
+        ),
     )
     parser.add_argument("--output", type=Path, help="Output HDF5 file.")
     parser.add_argument(
@@ -474,11 +767,12 @@ def main() -> None:
                 energy_unit=args.energy_unit,
             )
             try:
-                execute_pymca_workflow(
+                execute_est_workflow(
                     input_information=input_information,
                     input_file=input_file,
                     output_file=default_output_file(input_file, scan),
                     scan=scan,
+                    workflow_name=args.workflow,
                 )
             except Exception as exc:
                 print(
@@ -504,20 +798,22 @@ def main() -> None:
             energy_unit=args.energy_unit,
         )
         output_file = args.output or default_output_file(input_file, args.scan)
-        execute_pymca_workflow(
+        execute_est_workflow(
             input_information=input_information,
             input_file=input_file,
             output_file=output_file,
             scan=args.scan,
+            workflow_name=args.workflow,
         )
         return
 
     input_file, input_information = packaged_input_information()
     output_file = args.output or default_output_file(input_file, None)
-    execute_pymca_workflow(
+    execute_est_workflow(
         input_information=input_information,
         input_file=input_file,
         output_file=output_file,
+        workflow_name=args.workflow,
     )
 
 

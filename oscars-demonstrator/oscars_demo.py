@@ -138,6 +138,40 @@ def search_nxxas_entries(
     return hits
 
 
+def _get_with_retry(
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+    params: dict[str, Any] | None = None,
+    timeout: float = 120,
+    max_retries: int = 4,
+    backoff: float = 2.0,
+) -> requests.Response:
+    """GET with exponential backoff on 429/5xx.
+
+    These are public demo servers (NOMAD staging, the BESSY oasis) that rate-
+    limit or transiently 5xx under a burst of sequential requests (e.g.
+    downloading 9 entries back-to-back) — observed in practice, not
+    hypothetical. Honors ``Retry-After`` when the server sends one.
+    """
+    import time
+
+    for attempt in range(max_retries + 1):
+        resp = requests.get(url, headers=headers, params=params, timeout=timeout)
+        if resp.status_code not in (429, 500, 502, 503, 504) or attempt == max_retries:
+            resp.raise_for_status()
+            return resp
+        wait = backoff**attempt
+        retry_after = resp.headers.get("Retry-After")
+        if retry_after:
+            try:
+                wait = max(wait, float(retry_after))
+            except ValueError:
+                pass
+        time.sleep(wait)
+    raise AssertionError("unreachable")  # loop above always returns or raises
+
+
 def download_nxs_entry(
     entry_id: str,
     dest_dir: Path,
@@ -150,7 +184,8 @@ def download_nxs_entry(
     Equivalent to ``nomad_utility_workflows...download_entry_raw_data_by_id``,
     inlined so the notebook has no hard dependency on that package. Facility-
     agnostic — pass the ``nomad_api`` the entry was found on (e.g. from a
-    ``search_nxxas_entries`` hit's ``nomad_api`` field).
+    ``search_nxxas_entries`` hit's ``nomad_api`` field). Retries with backoff
+    on transient 429/5xx (see ``_get_with_retry``).
     """
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -159,13 +194,12 @@ def download_nxs_entry(
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
-    resp = requests.get(
+    resp = _get_with_retry(
         f"{nomad_api}/entries/{entry_id}/raw",
         headers=headers,
         params={"compress": "true"},
         timeout=120,
     )
-    resp.raise_for_status()
 
     extracted: list[Path] = []
     with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
@@ -424,12 +458,13 @@ def run_ewoks_exafs(
     nxs_file: Path,
     output_h5: Path,
     signal: str = "mu_trans",
-    energy_unit: str = "electron_volt",
-    run_pymca_demo_dir: Path | None = None,
+    energy_unit: str | None = None,
+    workflow: str = "example_pymca",
+    run_workflow_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Run the ewoks/est EXAFS workflow on a NXxas ``.nxs``.
 
-    Thin wrapper over ``run_pymca_demo.py``'s proven headless path (NXxas
+    Thin wrapper over ``run_workflow.py``'s proven headless path (NXxas
     detection + est PyMca graph). That file is kept **beside this module** (a
     sibling in the demonstrator folder), not referenced from the wider repo, so
     the whole demonstrator uploads to NOMAD/NORTH as one self-contained folder.
@@ -439,6 +474,17 @@ def run_ewoks_exafs(
     For base-NXxas files (BESSY) the processed signal lives at
     ``entry/intensity`` — pass ``signal="intensity"``. For ESRF NXxas_trans,
     ``signal="mu_trans"`` resolves to the itrans detector.
+
+    *energy_unit* defaults to ``None``, auto-detecting the unit from the
+    energy dataset's own ``units`` attribute (see
+    ``run_workflow.resolve_energy_unit``) instead of assuming one unit for
+    every facility/file — pass an explicit unit to override.
+
+    *workflow* selects the est tutorial ``.ows`` graph (see
+    ``run_workflow.execute_est_workflow``). Default ``"example_pymca"`` is
+    the one proven against every file this demo has been tested with;
+    ``"example_larch"`` is wired in but currently fails on at least the
+    BESSY myspot file — treat it as experimental.
     """
     import importlib.util
     import os
@@ -446,11 +492,11 @@ def run_ewoks_exafs(
 
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-    demo_dir = Path(run_pymca_demo_dir or Path(__file__).resolve().parent)
-    demo_py = demo_dir / "run_pymca_demo.py"
-    spec = importlib.util.spec_from_file_location("run_pymca_demo", demo_py)
+    demo_dir = Path(run_workflow_dir or Path(__file__).resolve().parent)
+    demo_py = demo_dir / "run_workflow.py"
+    spec = importlib.util.spec_from_file_location("run_workflow", demo_py)
     mod = importlib.util.module_from_spec(spec)
-    sys.modules["run_pymca_demo"] = mod
+    sys.modules["run_workflow"] = mod
     spec.loader.exec_module(mod)
 
     nxs_file = sanitize_signal_units(Path(nxs_file))
@@ -460,11 +506,12 @@ def run_ewoks_exafs(
         Path(nxs_file), scan=scan, energy="Emono", signal=signal,
         energy_unit=energy_unit,
     )
-    result = mod.execute_pymca_workflow(
+    result = mod.execute_est_workflow(
         input_information=info,
         input_file=Path(nxs_file),
         output_file=Path(output_h5),
         scan=scan,
+        workflow_name=workflow,
     )
     return {"scan": scan, "result_file": str(output_h5), "raw_result": result}
 
