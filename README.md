@@ -1,5 +1,12 @@
 # OSCARS XAS Demonstrator
 
+> [!WARNING]
+> This repository has been archived and is no longer actively maintained.
+>
+> The example code has been moved to the [`nomad-semantic-web-service`](https://github.com/opentdf/platform/tree/main/otdfctl) plugin as a NOMAD example upload.
+
+
+
 An end-to-end demonstrator for **findable, interoperable X-ray absorption
 spectroscopy (XAS)** built for the OSCARS project
 ([Findable big data for various material characterisation techniques](https://oscars-project.eu/projects/findable-big-data-various-material-characterisation-techniques-0)).
